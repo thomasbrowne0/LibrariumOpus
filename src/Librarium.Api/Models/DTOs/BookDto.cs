@@ -6,5 +6,6 @@ public class BookDto
     public string Title { get; set; } = string.Empty;
     public string ISBN { get; set; } = string.Empty;
     public int PublicationYear { get; set; }
+    public DateTime? RetiredAt { get; set; }
     public IEnumerable<AuthorDto> Authors { get; set; } = new List<AuthorDto>();
 }
