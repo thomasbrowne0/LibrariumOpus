@@ -8,21 +8,21 @@ using Microsoft.EntityFrameworkCore;
 namespace Librarium.Api.Controllers;
 
 [ApiController]
-[Route("api/[controller]")]
-public class LoansController : ControllerBase
+[Route("api/v2/loans")]
+public class LoansV2Controller : ControllerBase
 {
     private readonly LibrariumDbContext _context;
 
-    public LoansController(LibrariumDbContext context)
+    public LoansV2Controller(LibrariumDbContext context)
     {
         _context = context;
     }
 
     /// <summary>
-    /// Create a new loan
+    /// Create a new loan (API v2)
     /// </summary>
     [HttpPost]
-    public async Task<ActionResult<LoanDto>> CreateLoan([FromBody] CreateLoanRequest request)
+    public async Task<ActionResult<LoanDtoV2>> CreateLoan([FromBody] CreateLoanRequest request)
     {
         // Validate that book exists
         var book = await _context.Books.FindAsync(request.BookId);
@@ -50,22 +50,23 @@ public class LoansController : ControllerBase
         _context.Loans.Add(loan);
         await _context.SaveChangesAsync();
 
-        var loanDto = new LoanDto
+        var loanDto = new LoanDtoV2
         {
             LoanId = loan.Id,
             BookTitle = book.Title,
             LoanDate = loan.LoanDate,
-            ReturnDate = loan.ReturnDate
+            ReturnDate = loan.ReturnDate,
+            Status = loan.Status
         };
 
         return CreatedAtAction(nameof(GetLoansByMember), new { memberId = loan.MemberId }, loanDto);
     }
 
     /// <summary>
-    /// Get all loans for a member
+    /// Get all loans for a member (API v2)
     /// </summary>
     [HttpGet("{memberId}")]
-    public async Task<ActionResult<IEnumerable<LoanDto>>> GetLoansByMember(int memberId)
+    public async Task<ActionResult<IEnumerable<LoanDtoV2>>> GetLoansByMember(int memberId)
     {
         // Validate that member exists
         var memberExists = await _context.Members.AnyAsync(m => m.Id == memberId);
@@ -77,12 +78,13 @@ public class LoansController : ControllerBase
         var loans = await _context.Loans
             .Include(l => l.Book)
             .Where(l => l.MemberId == memberId)
-            .Select(l => new LoanDto
+            .Select(l => new LoanDtoV2
             {
                 LoanId = l.Id,
                 BookTitle = l.Book.Title,
                 LoanDate = l.LoanDate,
-                ReturnDate = l.ReturnDate
+                ReturnDate = l.ReturnDate,
+                Status = l.Status
             })
             .ToListAsync();
 
