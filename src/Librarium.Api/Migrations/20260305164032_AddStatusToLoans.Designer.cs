@@ -3,6 +3,7 @@ using System;
 using Librarium.Api.Data;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 
@@ -11,9 +12,11 @@ using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 namespace Librarium.Api.Migrations
 {
     [DbContext(typeof(LibrariumDbContext))]
-    partial class LibrariumDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260305164032_AddStatusToLoans")]
+    partial class AddStatusToLoans
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder
@@ -123,7 +126,7 @@ namespace Librarium.Api.Migrations
                     b.Property<DateTime?>("ReturnDate")
                         .HasColumnType("timestamp with time zone");
 
-                    b.Property<int>("Status")
+                    b.Property<int?>("Status")
                         .HasColumnType("integer");
 
                     b.HasKey("Id");

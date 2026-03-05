@@ -579,6 +579,228 @@ Deliberately avoided CHECK constraints for phone number format (e.g., regex patt
 
 ---
 
+## V6 - AddStatusToLoans
+
+**Date:** March 5, 2026  
+**Migration File:** `V6__AddStatusToLoans.sql`  
+**EF Migration:** `20260305164032_AddStatusToLoans`
+
+### Description
+Adds a status tracking field to the Loans table to indicate the current state of a loan (Active, Returned, Overdue). This field is initially nullable to allow existing loan records to remain valid during the transition period.
+
+### Type of Change
+**Additive (Non-Breaking)** - Adds an optional column without affecting existing data or requiring immediate changes.
+
+### Schema Changes
+
+**Enum Added:**
+- `LoanStatus` enum: Active (0), Returned (1), Overdue (2)
+
+**Column Added:**
+- `Status` (integer, nullable) to Loans table
+
+### API Impact
+
+**API Versioning Introduced:**
+- **API v1:** `/api/loans` - Continues using ReturnDate for backward compatibility (no Status field)
+- **API v2:** `/api/v2/loans` - Exposes new Status field alongside ReturnDate
+
+**v1 Endpoint Behavior (Unchanged):**
+- `GET /api/loans/{memberId}` - Returns loans without Status field
+- `POST /api/loans` - Creates loans, Status set internally but not exposed
+
+**v2 Endpoint Behavior (New):**
+- `GET /api/v2/loans/{memberId}` - Returns loans with Status field
+- `POST /api/v2/loans` - Creates loans, Status exposed in response
+
+**Response Contract Changes:**
+
+*v1 Response (Backward Compatible):*
+```json
+{
+  "loanId": 1,
+  "bookTitle": "The Great Gatsby",
+  "loanDate": "2026-03-01T10:00:00Z",
+  "returnDate": null
+}
+```
+
+*v2 Response (New):*
+```json
+{
+  "loanId": 1,
+  "bookTitle": "The Great Gatsby",
+  "loanDate": "2026-03-01T10:00:00Z",
+  "returnDate": null,
+  "status": 0
+}
+```
+
+**Breaking Changes:** None - existing v1 clients unaffected by new v2 endpoints.
+
+### Deployment Notes
+
+**Order of Operations:**
+1. Apply database migration (adds nullable column)
+2. Deploy application code with v2 endpoints
+3. Communicate v2 API availability to consumers
+4. No immediate data entry required
+
+**Zero-Downtime:** Yes
+
+**Deployment Window Behavior:**
+- **Migration applied, old code running:** New column exists but unused. No impact.
+- **New code deployed:** v1 API unchanged, v2 API available with Status field (null for existing loans).
+
+**Rollback Strategy:**
+- Revert application code (removes v2 endpoints)
+- Drop column: `ALTER TABLE "Loans" DROP COLUMN "Status";`
+
+**API Versioning Strategy:**
+- v1 endpoints maintain backward compatibility indefinitely
+- v2 endpoints expose enhanced functionality
+- Both versions coexist, allowing gradual client migration
+- Future: v1 can be deprecated after transition period (e.g., 6-12 months)
+
+### Decisions and Tradeoffs
+
+**API Versioning Approach:**
+Chose URL-based versioning (`/api/loans` vs `/api/v2/loans`) over header-based or query parameter versioning. URL versioning provides: (1) Clear visibility - clients explicitly choose their version; (2) Easy testing - can curl/browse different versions directly; (3) Caching friendly - different URLs allow different cache policies; (4) Documentation clarity - Swagger/OpenAPI can document versions separately. Tradeoff: More controller code (separate v1/v2 controllers or methods). Alternative header-based versioning (`Accept: application/vnd.librarium.v2+json`) is more RESTful but less discoverable and harder for non-technical consumers. URL versioning prioritizes pragmatism over REST purity.
+
+**Status as Integer Enum:**
+Stored Status as integer (0, 1, 2) rather than string ("Active", "Returned", "Overdue"). Benefits: (1) Smaller storage (4 bytes vs ~8 bytes); (2) Faster comparisons and indexing; (3) Type safety in C# with enum; (4) Easy to add new statuses (e.g., Lost = 3) without migration. Tradeoff: Database queries less readable (`WHERE Status = 0` vs `WHERE Status = 'Active'`). Application layer handles enum-to-string conversion for API responses, keeping database efficient while API remains human-readable.
+
+**Nullable Initially:**
+Made Status nullable in V6 rather than immediately required, following expand-contract pattern from Phase 3. Existing loan records don't have status, and deriving status from ReturnDate can be done in a controlled manner in V7. This two-step approach: (1) Allows migration to succeed on existing data; (2) Provides testing window before making required; (3) Enables gradual status population if needed. V7 will backfill and make required.
+
+**Parallel v1/v2 APIs:**
+Maintained both v1 (ReturnDate-based) and v2 (Status-based) APIs rather than forcing immediate migration. This allows: (1) Existing integrations continue working; (2) New clients adopt enhanced Status field; (3) Gradual migration path; (4) Testing new functionality without risk. Tradeoff: More code to maintain two versions. Alternative breaking change (remove ReturnDate, force Status) would simplify code but break all existing clients. Backward compatibility chosen over simplicity.
+
+**Status vs ReturnDate Relationship:**
+Status and ReturnDate are related but serve different purposes: (1) ReturnDate records when book was physically returned (audit trail); (2) Status indicates current state (business logic). A loan can be marked Overdue (status) while ReturnDate is still null. Status provides richer semantics than binary "returned or not" from ReturnDate. Future enhancement: automated status updates (e.g., cron job marks loans overdue based on loan date + policy duration). Keeping both fields provides flexibility for business logic evolution.
+
+---
+
+## V7 - MakeLoanStatusRequired
+
+**Date:** March 5, 2026  
+**Migration File:** `V7__MakeLoanStatusRequired.sql`  
+**EF Migration:** `20260305164131_MakeLoanStatusRequired`
+
+### Description
+Makes the Status field mandatory in the Loans table. This completes the transition started in V6, with intelligent backfilling that derives status from the existing ReturnDate field.
+
+### Type of Change
+**Requires Coordination** - Modifies existing data and schema constraints.
+
+### Schema Changes
+
+**Column Modified:**
+- `Status` changed from nullable to NOT NULL
+- Default value of `0` (Active) applied to new records via schema default
+
+**Data Migration:**
+- Existing loans backfilled with Status derived from ReturnDate:
+  - `ReturnDate IS NULL` → `Status = 0 (Active)`
+  - `ReturnDate IS NOT NULL` → `Status = 1 (Returned)`
+
+### API Impact
+
+**Endpoint Behavior Changes:**
+- `GET /api/loans/{memberId}` (v1) - No change, Status still not exposed
+- `GET /api/v2/loans/{memberId}` (v2) - Status field now always present (never null)
+- `POST /api/loans` (v1) - Creates loans with Status = Active internally
+- `POST /api/v2/loans` (v2) - Creates loans with Status = Active, exposed in response
+
+**Response Contract Changes:**
+
+*v2 Previous Response (V6):*
+```json
+{
+  "loanId": 1,
+  "bookTitle": "The Great Gatsby",
+  "loanDate": "2026-03-01T10:00:00Z",
+  "returnDate": null,
+  "status": null
+}
+```
+
+*v2 New Response (V7):*
+```json
+{
+  "loanId": 1,
+  "bookTitle": "The Great Gatsby",
+  "loanDate": "2026-03-01T10:00:00Z",
+  "returnDate": null,
+  "status": 0
+}
+```
+
+**Breaking Changes:**
+- **v2 API:** Status field changes from nullable to non-nullable (minor breaking change for strict typing)
+- **v1 API:** No breaking changes (Status still not exposed)
+
+### Deployment Notes
+
+**Order of Operations:**
+1. Apply V7 migration (backfills Status, makes field required)
+2. Application code already handles required Status (deployed in V6)
+3. Monitor v2 API responses to verify Status populated correctly
+
+**Zero-Downtime:** Yes - application code from V6 already sets Status on new loans.
+
+**Deployment Window Behavior:**
+- **Migration applied, V6 code running:** Database has all Status values, code creates new loans with Status. **Safe.**
+- **V7 code deployed (same as V6 for this migration):** No code changes needed, Status already handled. **Safe.**
+
+**Backfill Logic:**
+- Migration uses CASE statement to intelligently derive Status:
+  ```sql
+  UPDATE "Loans" 
+  SET "Status" = CASE 
+      WHEN "ReturnDate" IS NULL THEN 0  -- Active
+      ELSE 1                             -- Returned
+  END 
+  WHERE "Status" IS NULL;
+  ```
+- Does not set Overdue status during backfill (requires date calculation and policy knowledge)
+- Future enhancement: scheduled job to update Active → Overdue based on loan duration policy
+
+**Rollback Strategy:**
+- If immediate rollback needed: `ALTER TABLE "Loans" ALTER COLUMN "Status" DROP NOT NULL;`
+- Application code unchanged (already handles Status from V6)
+- Data remains intact (backfilled values persist but become nullable again)
+
+### Decisions and Tradeoffs
+
+**Two-Step Migration (V6 → V7):**
+Split Status implementation across two migrations following expand-contract pattern. V6 added nullable Status, V7 makes it required. Benefits: (1) V6 migration guaranteed to succeed (no constraint violations); (2) Testing period between V6 and V7 to verify Status logic; (3) Independent rollback points; (4) Gradual schema evolution. Alternative single-step migration would be simpler but riskier - if Status logic has bugs, easier to catch with nullable phase first. Cost: two migrations instead of one, but safety justifies overhead.
+
+**Intelligent Backfill from ReturnDate:**
+Derived Status from existing ReturnDate rather than defaulting all to Active. Logic: loans with ReturnDate are clearly Returned, loans without are Active. This preserves historical accuracy for existing data. Alternative naive approach (set all to Active) would corrupt historical data - returned loans would appear active. Backfill accuracy critical for reporting and analytics. Only limitation: cannot detect Overdue from static data (requires current date comparison and policy rules).
+
+**No Overdue Detection in Migration:**
+Backfill does not set Status = Overdue for any loans, only Active or Returned. Rationale: (1) Overdue requires business logic (loan duration policy, grace periods); (2) Overdue depends on current date (migration should be time-independent); (3) Overdue rules may vary by member type or book type. Safer to default to Active/Returned and let application layer or scheduled job apply Overdue logic based on current policy. Future: implement background job that periodically scans Active loans and updates to Overdue based on configurable rules.
+
+**Schema Default vs Application Default:**
+Migration adds `DEFAULT 0` at database level for new records, ensuring Status = Active even if application layer fails to set it. This provides defense-in-depth: (1) Application sets Status explicitly; (2) Database default as fallback; (3) NOT NULL constraint prevents gaps. Layered approach reduces risk of missing Status values. Application layer remains primary authority (can override default), database constraint acts as safety net.
+
+**Backward Compatibility Preservation:**
+v1 API continues to not expose Status field even after V7. This maintains perfect backward compatibility - existing clients see zero changes. Only clients explicitly opting into v2 API see Status. This allows: (1) Legacy integrations run indefinitely; (2) New clients get enhanced features; (3) Migration to v2 on client timeline, not forced. Tradeoff: maintaining two API versions adds complexity. Plan: monitor v1 usage, deprecate after 12-month transition period (announce in V8, remove in V9).
+
+**Status Update Responsibility:**
+Migration makes Status required but does not implement status transition logic (e.g., Active → Overdue, Active → Returned). Status updates remain application responsibility. When a loan is returned, application must: (1) Set ReturnDate; (2) Set Status = Returned. Keeping logic in application allows: (1) Complex business rules (e.g., grace periods); (2) Audit logging of status changes; (3) Validation and permissions; (4) Easy rule updates without migration. Database enforces data integrity (NOT NULL), application enforces business rules.
+
+**Future Enhancements:**
+- Implement scheduled job for Overdue detection (e.g., daily scan of Active loans)
+- Add Status transition logging for audit trail (StatusHistory table)
+- Introduce additional statuses: Lost (3), Renewed (4), Cancelled (5)
+- API endpoint for manual status updates with validation
+- Reporting dashboard showing loan status distribution
+- Email notifications on status changes (especially Overdue)
+
+---
+
 ## Migration History Summary
 
 | Version | Date | Type | Description |
@@ -589,6 +811,8 @@ Deliberately avoided CHECK constraints for phone number format (e.g., regex patt
 | V3.5 | 2026-03-05 | Destructive (Manual) | Data cleanup script for duplicate email addresses |
 | V4 | 2026-03-05 | Requires Coordination | Added unique index on Members.Email |
 | V5 | 2026-03-05 | Requires Coordination | Made PhoneNumber required with default backfill |
+| V6 | 2026-03-05 | Additive (Non-Breaking) | Added optional Status column to Loans with API v2 versioning |
+| V7 | 2026-03-05 | Requires Coordination | Made Status required with intelligent backfill from ReturnDate |
 
 ---
 
