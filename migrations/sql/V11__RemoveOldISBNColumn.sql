@@ -1,0 +1,11 @@
+﻿START TRANSACTION;
+
+ALTER TABLE "Books" DROP COLUMN "ISBN";
+
+ALTER TABLE "Books" RENAME COLUMN "ISBNNew" TO "ISBN";
+
+INSERT INTO "__EFMigrationsHistory" ("MigrationId", "ProductVersion")
+VALUES ('20260305165724_RemoveOldISBNColumn', '8.0.11');
+
+COMMIT;
+

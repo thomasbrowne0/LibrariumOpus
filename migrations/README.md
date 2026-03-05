@@ -919,6 +919,266 @@ The global query filter adds a `WHERE RetiredAt IS NULL` condition to every Book
 
 ---
 
+## V9 - AddISBNNewColumn
+
+**Date:** March 5, 2026  
+**Migration File:** `V9__AddISBNNewColumn.sql`  
+**EF Migration:** `20260305165439_AddISBNNewColumn`
+
+### Description
+First step of the expand-contract pattern for changing ISBN field from varchar(20) to varchar(50). Adds a new ISBNNew column that will eventually replace the existing ISBN column. This supports longer ISBN formats and future-proofs the schema.
+
+### Type of Change
+**Additive (Non-Breaking)** - Adds a new nullable column without affecting existing functionality.
+
+### Schema Changes
+
+**Column Added:**
+- `ISBNNew` (character varying(50), nullable) to Books table
+
+**Justification for Type Change:**
+- Original ISBN column: varchar(20), sufficient for ISBN-10 and ISBN-13
+- New ISBNNew column: varchar(50), supports:
+  - ISBN-13 with full formatting (e.g., "978-3-16-148410-0")
+  - Future ISBN variants or extended formats
+  - Concatenated ISBNs or edition identifiers
+  - Buffer for any future bibliographic standard changes
+
+### API Impact
+
+**No API Changes** - This is an internal infrastructure migration. The application continues using the existing ISBN column.
+
+**Breaking Changes:** None
+
+### Deployment Notes
+
+**Order of Operations:**
+1. Apply database migration (adds nullable ISBNNew column)
+2. Deploy application code (no changes required at this stage)
+3. ISBNNew column remains null for all existing records
+
+**Zero-Downtime:** Yes
+
+**Deployment Window Behavior:**
+- **Migration applied, old code running:** ISBNNew column exists but unused. No impact.
+- **New code deployed:** No code changes in V9, behavior unchanged.
+
+**Rollback Strategy:**
+- Drop column: `ALTER TABLE "Books" DROP COLUMN "ISBNNew";`
+- No application code changes needed
+
+### Decisions and Tradeoffs
+
+**Expand-Contract Pattern:**
+Chose expand-contract migration strategy over direct column modification. Direct `ALTER COLUMN` to increase length would be simpler (single migration) but riskier: (1) Potential locking issues on large tables during type change; (2) No rollback path if issues discovered; (3) Cannot test new column independently. Expand-contract provides: (1) Zero-downtime deployment; (2) Independent testing of new column; (3) Clear rollback at each stage; (4) Gradual migration of data and application code. Tradeoff: more migrations to manage and coordinate, but significantly safer for production.
+
+**New Column vs. Inline Modification:**
+Added ISBNNew as separate column rather than immediately modifying ISBN. This allows: (1) Dual-write period where both columns maintained; (2) Gradual migration of existing ISBNs; (3) Verification that all data migrated correctly before dropping old column; (4) Rollback without data loss. PostgreSQL supports increasing varchar length without rewriting the table (metadata-only change), but expand-contract demonstrates the pattern applicable to more complex type changes (e.g., int→varchar, which motivated this phase).
+
+**varchar(50) Size:**
+Chose 50 characters to accommodate various scenarios: (1) ISBN-13 with full formatting and hyphens: ~17 chars; (2) Multiple ISBNs or edition info: 30-40 chars; (3) Buffer for unforeseen formats: +10 chars. Alternative varchar(100) considered but rejected - too much overhead for unlikely edge cases. Alternative varchar(30) too constrained for future flexibility. 50 strikes balance between flexibility and efficiency.
+
+**Nullable Initially:**
+Made ISBNNew nullable in V9 rather than immediately required. This is standard expand-contract: (1) Allows migration to apply to existing data (millions of books with null ISBNNew); (2) Provides window for controlled backfill in V10; (3) Allows testing before enforcement. V10 will backfill and make required.
+
+---
+
+## V10 - MakeISBNNewRequired
+
+**Date:** March 5, 2026  
+**Migration File:** `V10__MakeISBNNewRequired.sql`  
+**EF Migration:** `20260305165534_MakeISBNNewRequired`
+
+### Description
+Second step of the expand-contract pattern. Backfills ISBNNew column from existing ISBN data and makes the column required. This ensures data integrity before switching the application to use the new column.
+
+### Type of Change
+**Requires Coordination** - Modifies existing data and schema constraints with backfill operation.
+
+### Schema Changes
+
+**Column Modified:**
+- `ISBNNew` changed from nullable to NOT NULL
+- Default value of `""` applied to prevent future null inserts
+
+**Data Migration:**
+- All existing books: `ISBNNew = ISBN` (direct copy)
+- Backfills before making column required to prevent constraint violations
+
+**Backfill SQL:**
+```sql
+UPDATE "Books" 
+SET "ISBNNew" = "ISBN" 
+WHERE "ISBNNew" IS NULL;
+```
+
+### API Impact
+
+**No API Changes** - Application still uses ISBN column. ISBNNew populated in background.
+
+**Breaking Changes:** None at API level.
+
+### Deployment Notes
+
+**Order of Operations:**
+1. Apply V10 migration (backfills ISBNNew, makes required)
+2. Deploy application code (still using ISBN, no changes yet)
+3. Verify ISBNNew data correctness in database
+4. Proceed to V11 when ready
+
+**Zero-Downtime:** Yes - backfill runs on existing data, application unaffected.
+
+**Deployment Window Behavior:**
+- **Migration applied, old code running:** ISBNNew populated but unused. ISBN still primary. Safe.
+- **New code deployed (V10 has no code changes):** Behavior unchanged.
+
+**Backfill Performance:**
+- UPDATE on entire Books table - can be slow on large datasets
+- Consider chunked backfill for tables >1M rows:
+  ```sql
+  DO $$
+  DECLARE batch_size INT := 10000;
+  BEGIN
+    LOOP
+      UPDATE "Books" SET "ISBNNew" = "ISBN"
+      WHERE "Id" IN (
+        SELECT "Id" FROM "Books" 
+        WHERE "ISBNNew" IS NULL 
+        LIMIT batch_size
+      );
+      EXIT WHEN NOT FOUND;
+      COMMIT;
+    END LOOP;
+  END $$;
+  ```
+- For typical library systems (<100K books), direct UPDATE acceptable
+
+**Rollback Strategy:**
+- Revert to nullable: `ALTER TABLE "Books" ALTER COLUMN "ISBNNew" DROP NOT NULL;`
+- Data preserved (backfilled values remain)
+- Application code unchanged, rollback straightforward
+
+### Decisions and Tradeoffs
+
+**Direct Copy Backfill:**
+Backfill uses simple `ISBNNew = ISBN` copy. No transformation applied because: (1) Existing ISBNs already valid strings; (2) No format standardization needed at this stage; (3) Preserves exact existing data. Alternative: apply ISBN normalization during backfill (remove hyphens, validate format). Rejected because: (1) Risk of introducing inconsistencies; (2) Data quality improvement should be separate migration; (3) Backfill should be idempotent and predictable. If ISBN normalization needed, implement as separate V9.5 data migration before V10.
+
+**Backfill Before Constraint:**
+Migration explicitly backfills NULL values BEFORE altering column to NOT NULL. Critical because: (1) ALTER COLUMN to NOT NULL fails if any nulls exist; (2) Explicit UPDATE logged in migration for audit trail; (3) Can monitor backfill progress independently. PostgreSQL requires existing rows migrated before adding NOT NULL constraint - default value only applies to future inserts, not existing nulls.
+
+**No Dual-Write Yet:**
+V10 does not update application to write to both ISBN and ISBNNew. Application still writes only to ISBN. Next deployment (post-V10, pre-V11) will switch reads/writes to ISBNNew. This staged approach: (1) Ensures ISBNNew populated before application relies on it; (2) Allows verification of backfill accuracy; (3) Reduces deployment risk - data migration separate from application migration. Dual-write period is implicit between V10 deployment and V11 deployment.
+
+**Default Value Strategy:**
+Used empty string `""` as default for new inserts. This ensures NOT NULL constraint satisfied even if application bug omits ISBN. Alternative: no default, rely on application validation. Rejected because database-level defense-in-depth prevents data integrity issues. Empty string distinguishable from valid ISBN,signals missing data while maintaining constraint.
+
+---
+
+## V11 - RemoveOldISBNColumn
+
+**Date:** March 5, 2026  
+**Migration File:** `V11__RemoveOldISBNColumn.sql`  
+**EF Migration:** `20260305165724_RemoveOldISBNColumn`
+
+### Description
+Final step of the expand-contract pattern. Removes the old ISBN column and renames ISBNNew to ISBN, completing the migration. After this migration, the ISBN column is varchar(50) instead of varchar(20).
+
+### Type of Change
+**Destructive (Potentially Breaking)** - Drops a column. If any code still references old ISBN, will break.
+
+### Schema Changes
+
+**Column Dropped:**
+- `ISBN` (character varying(20)) - old ISBN column removed
+
+**Column Renamed:**
+- `ISBNNew` renamed to `ISBN`
+- Final state: `ISBN` (character varying(50), NOT NULL)
+
+**Migration Operations:**
+1. `DROP COLUMN "ISBN"` - removes old 20-char column
+2. `RENAME COLUMN "ISBNNew" TO "ISBN"` - new 50-char column becomes ISBN
+
+### API Impact
+
+**Application Code Changes (Deployed Before V11):**
+- Application already switched to use ISBNNew in previous deployment
+- Used `[Column("ISBNNew")]` attribute or `.HasColumnName("ISBNNew")` mapping
+- After V11 deployment, remove column mapping as column now named ISBN
+
+**Response Contract:**
+- No client-facing changes - ISBN field name unchanged in API
+- ISBN values now support up to 50 characters (previously 20)
+
+**Breaking Changes:**
+- Any code still directly querying old ISBN column will break
+- Application must be updated to use ISBNNew before applying V11
+- Recommend deprecation period: deploy ISBNNew-compatible code, wait 1-2 weeks, then apply V11
+
+### Deployment Notes
+
+**CRITICAL Pre-Deployment Requirements:**
+1. **Verify application deployed with ISBNNew mapping** - check production code uses ISBNNew column
+2. **Monitor logs for ISBN column access** - ensure no lingering references
+3. **Test rollback procedure** - confirm Down() migration recreates structure
+4. **Backup database** - V11 is destructive, backup critical
+
+**Order of Operations:**
+1. **Deploy application code** that uses ISBNNew (with column mapping)
+2. **Wait stabilization period** (1-2 weeks recommended)
+3. **Apply V11 migration** (drops ISBN, renames ISBNNew)
+4. **Deploy final code** removing column mapping attributes
+5. **Verify functionality** - all ISBN operations working
+
+**Zero-Downtime:** Partial
+- **With proper sequencing**: Application already using ISBNNew before V11, rename is fast, minimal downtime
+- **Without sequencing**: Application using ISBN, V11 drops column, application breaks. **HIGH RISK.**
+
+**Deployment Window Behavior:**
+- **V11 applied, old code (ISBN) running:** Application breaks - ISBN column not found. **CRITICAL FAILURE.**
+- **V11 applied, intermediate code (ISBNNew mapping) running:** Application works - mapped to ISBNNew (now ISBN). **Safe.**
+- **V11 applied, final code (no mapping) running:** Application works - direct ISBN access. **Safe.**
+
+**Rollback Strategy:**
+- `Down()` migration recreates old ISBN column and renames current ISBN to ISBNNew
+- **WARNING:** Rollback loses data written after V11 applied (ISBN values >20 chars truncated)
+- Rollback only safe if V11 applied very recently with no new data
+- Better recovery: restore from backup taken before V11
+
+**Index/Constraint Considerations:**
+- Any indexes or foreign keys on old ISBN column automatically dropped
+- ISBNNew inherits no indexes from old ISBN
+- If ISBN had index: recreate on new ISBN column post-rename
+- Check: `SELECT * FROM pg_indexes WHERE tablename = 'Books' AND indexname LIKE '%isbn%';`
+
+### Decisions and Tradeoffs
+
+**Drop Then Rename vs. Rename Both:**
+Migrationdrops old ISBN then renames ISBNNew to ISBN. Alternative approach: rename ISBN to ISBNOld, rename ISBNNew to ISBN, then drop ISBNOld. Comparison: (1) Current approach simpler - fewer operations; (2) Alternative provides brief rollback window (ISBNOld still exists momentarily); (3) PostgreSQL RENAME is metadata-only operation (fast), so timing difference negligible. Chose simpler approach - clear intent (remove old, promote new). If rollback needed, use V11 Down() migration.
+
+**Destructive Classification:**
+Classified as Destructive even though application updated first. Justification: (1) Migration physically deletes column from database; (2) Any uncoordinated deployment breaks application; (3) Rollback difficult/risky. Alternative classification: "Requires Coordination" (like V10). Rejected because: (1) True data loss risk if rollback attempted; (2) Higher risk profile than typical coordinated migration; (3) Destructive classification signals extra caution needed.
+
+**No Staged Rename:**
+Did not create intermediate step "rename both columns, then drop old". Pattern could be: V11a (rename ISBN to ISBNOld), V11b (drop ISBNOld). Rejected because: (1) Adds migration complexity; (2) Doesn't reduce risk materially (still requires app deployed); (3) Rename operation is fast enough for single migration; (4) ISBNOld not used, just dead weight. For very large tables (>10M rows), staged approach might help, but typical library systems don't warrant it.
+
+**Application Migration Strategy:**
+Required application code changes between V10 and V11: (1) Add `[Column("ISBNNew")]` or `.HasColumnName("ISBNNew")`; (2) Test thoroughly; (3) Deploy to production; (4) Monitor for issues; (5) Only then apply V11. This "application-first" ordering ensures: (1) Database changes applied to compatible code; (2) Rollback options preserved; (3) Clear separation between app and DB migrations. After V11, remove column mapping (final cleanup).
+
+**Data Validation:**
+Did not include ISBN format validation in V11 migration. New varchar(50) column accepts any string up to 50 chars. Rationale: (1) Data validation is application responsibility; (2) Legacy ISBNs may not conform to current standards; (3) Check constraint would block valid edge cases. If validation needed: implement as separate V12 migration with thorough testing, or handle in application layer with soft validation (warnings vs. errors).
+
+**Naming Consistency:**
+The migration temporarily creates ISBNNew, then renames it back to ISBN. Alternative: permanently rename to ISBNExtended or ISBNLong. Rejected because: (1) API consumers expect "ISBN" field name; (2) Database column name should match conceptual model; (3) Length change is implementation detail, not semantic change. Final state: same column name, enhanced capacity - seamless to application.
+
+**Performance Impact:**
+DROP COLUMN and RENAME COLUMN in PostgreSQL are metadata-only operations (do not rewrite table). Performance: (1) Drop: instant, removes column definition; (2) Rename: instant, updates system catalog; (3) No table lock beyond brief metadata update. For tables <1M rows: under 1 second. For larger tables: still fast, but coordinate with low-traffic window. Contrast with ALTER COLUMN TYPE (int→varchar) which would rewrite entire table.
+
+**Future-Proofing:**
+50-character limit chosen for current requirements, but what if longer needed? Strategy: (1) varchar can be extended further without expand-contract (increasing varchar length is safe in PostgreSQL 12+); (2) If truly unbounded length needed, migrate to text type; (3) Current size sufficient for 10+ years based on ISBN standards. Lesson: expand-contract pattern taught here, but not all type changes require it - know when to use simple vs. complex migration.
+
+---
+
 ## Migration History Summary
 
 | Version | Date | Type | Description |
@@ -932,6 +1192,9 @@ The global query filter adds a `WHERE RetiredAt IS NULL` condition to every Book
 | V6 | 2026-03-05 | Additive (Non-Breaking) | Added optional Status column to Loans with API v2 versioning |
 | V7 | 2026-03-05 | Requires Coordination | Made Status required with intelligent backfill from ReturnDate |
 | V8 | 2026-03-05 | Additive (Non-Breaking) | Added soft delete to Books with RetiredAt and global query filter |
+| V9 | 2026-03-05 | Additive (Non-Breaking) | Added ISBNNew column (varchar 50) for expand-contract pattern |
+| V10 | 2026-03-05 | Requires Coordination | Backfilled ISBNNew from ISBN and made required |
+| V11 | 2026-03-05 | Destructive (Potentially Breaking) | Dropped old ISBN column and renamed ISBNNew to ISBN |
 
 ---
 
