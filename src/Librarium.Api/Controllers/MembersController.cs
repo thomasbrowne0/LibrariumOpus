@@ -28,7 +28,8 @@ public class MembersController : ControllerBase
                 MemberId = m.Id,
                 FirstName = m.FirstName,
                 LastName = m.LastName,
-                Email = m.Email
+                Email = m.Email,
+                PhoneNumber = m.PhoneNumber
             })
             .ToListAsync();
 

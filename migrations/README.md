@@ -274,12 +274,321 @@ Made author biography nullable rather than required. Many legacy books or catalo
 
 ---
 
+## V3 - AddPhoneNumberToMembers
+
+**Date:** March 5, 2026  
+**Migration File:** `V3__AddPhoneNumberToMembers.sql`  
+**EF Migration:** `20260305162700_AddPhoneNumberToMembers`
+
+### Description
+Adds a phone number field to the Members table. This field is initially nullable to allow existing member records to remain valid during the transition period.
+
+### Type of Change
+**Additive (Non-Breaking)** - Adds an optional column without affecting existing data or requiring immediate changes.
+
+### Schema Changes
+
+**Column Added:**
+- `PhoneNumber` (varchar 20, nullable) to Members table
+
+### API Impact
+
+**Endpoint Behavior Changes:**
+- `GET /api/members` - Response schema expanded to include optional `phoneNumber` field
+
+**Response Contract Changes:**
+
+*Previous Member Response (V2):*
+```json
+{
+  "memberId": 1,
+  "firstName": "Anna",
+  "lastName": "Berg",
+  "email": "anna@example.com"
+}
+```
+
+*New Member Response (V3):*
+```json
+{
+  "memberId": 1,
+  "firstName": "Anna",
+  "lastName": "Berg",
+  "email": "anna@example.com",
+  "phoneNumber": null
+}
+```
+
+**Breaking Changes:** None - adding an optional field is non-breaking for REST clients.
+
+### Deployment Notes
+
+**Order of Operations:**
+1. Apply database migration (adds nullable column)
+2. Deploy application code
+3. No immediate data entry required
+
+**Zero-Downtime:** Yes
+
+**Deployment Window Behavior:**
+- **Migration applied, old code running:** New column exists but unused. No impact.
+- **New code deployed:** API returns `phoneNumber` field (null for existing members).
+
+**Rollback Strategy:**
+- Revert application code
+- Drop column: `ALTER TABLE "Members" DROP COLUMN "PhoneNumber";`
+
+### Decisions and Tradeoffs
+
+**Nullable Initially:**
+Made PhoneNumber nullable in this first migration rather than immediately required. This is a multi-step migration strategy to avoid breaking existing data. Existing member records don't have phone numbers, and requiring this field immediately would either require a mass data entry effort or prevent the migration from applying. A subsequent migration (V5) will backfill default values and make this field required after stakeholders have had time to populate real phone numbers. This staged approach reduces risk and allows gradual data quality improvement.
+
+**Field Length:**
+Chose `varchar(20)` to accommodate various phone number formats including country codes, extensions, and formatting characters (e.g., "+1 (555) 123-4567"). International phone numbers can be up to 15 digits plus formatting. A 20-character limit provides flexibility without excessive storage overhead. No validation logic applied at database level - validation happens in application layer to accommodate different regional formats.
+
+---
+
+## V3.5 - CleanupDuplicateEmails (Manual Script)
+
+**Date:** March 5, 2026  
+**Migration File:** `V3.5__CleanupDuplicateEmails.sql`  
+**Type:** Manual Data Cleanup Script (Not an EF Migration)
+
+### Description
+This is a **manual cleanup script** that must be run before applying V4. It identifies and resolves duplicate email addresses in the Members table, which would otherwise cause V4's unique constraint to fail.
+
+### Type of Change
+**Destructive** - Modifies or removes existing data based on business rules.
+
+### Purpose
+
+The script provides two strategies for resolving duplicate emails:
+
+**Strategy 1: Merge Duplicates (Recommended)**
+- Keeps the oldest member account (lowest ID)
+- Reassigns all loans from duplicate accounts to the kept account
+- Deletes duplicate member records
+- Preserves all loan history
+
+**Strategy 2: Disambiguate Email Addresses**
+- Keeps all member records
+- Adds suffix to duplicate emails (e.g., `email@example.com_duplicate_1`)
+- No data loss, but creates "fake" email addresses
+
+### Deployment Notes
+
+**CRITICAL:** This script must be executed during a maintenance window BEFORE applying V4__EnforceEmailUniqueness.sql.
+
+**Order of Operations:**
+1. Run identification queries to review duplicates
+2. Stakeholders decide which merge strategy to use
+3. Execute chosen resolution strategy (uncomment relevant section)
+4. Verify no duplicates remain
+5. Only then apply V4 migration
+
+**Risk:** If duplicates exist when V4 is applied, the unique constraint creation will fail and block the migration.
+
+### Decisions and Tradeoffs
+
+**Manual Script vs. Automated:**
+Chose a manual script over automatic resolution because merging member accounts is a business decision requiring human judgment. Different scenarios may require different resolutions: some duplicates might be legitimate separate accounts (e.g., family members sharing an email), others might be data entry errors. Providing multiple strategies and requiring manual review ensures data accuracy and prevents unintended data loss.
+
+**Merge Strategy Selection:**
+Recommended "keep oldest, reassign loans" approach based on common patterns: the first account created is typically the "real" one, and subsequent duplicates are often accidental recreations. This preserves all transactional history while cleaning up duplicate identities. Alternative email disambiguation strategy provides a safety net for organizations uncomfortable with deleting member records, though it creates operational challenges (invalid email addresses).
+
+---
+
+## V4 - EnforceEmailUniqueness
+
+**Date:** March 5, 2026  
+**Migration File:** `V4__EnforceEmailUniqueness.sql`  
+**EF Migration:** `20260305162825_EnforceEmailUniqueness`
+
+### Description
+Adds a unique index on the Email column of the Members table, enforcing that each email address can only be used once. This supports the business requirement for email as the login identifier.
+
+### Type of Change
+**Requires Coordination** - Non-breaking if applied correctly, but requires careful sequencing.
+
+### Schema Changes
+
+**Index Created:**
+- Unique index `IX_Members_Email` on Members(Email)
+
+**Prerequisites:**
+- All duplicate emails must be resolved (via V3.5 cleanup script)
+
+### API Impact
+
+**No API Contract Changes** - Endpoints remain unchanged.
+
+**Behavioral Changes:**
+- Creating or updating a member with a duplicate email will now fail
+- Application must handle unique constraint violations gracefully
+- Error response example:
+```json
+{
+  "error": "Email address already in use",
+  "code": "DuplicateEmail"
+}
+```
+
+**Breaking Changes:** None at API level, but client applications must handle new error conditions.
+
+###Deployment Notes
+
+**Order of Operations:**
+1. **FIRST:** Run V3.5 cleanup script to resolve duplicate emails
+2. Verify no duplicates remain
+3. Apply V4 migration (creates unique index)
+4. Deploy application code with error handling for duplicate emails
+5. Update frontend validation to check email uniqueness
+
+**Zero-Downtime:** Yes, if prerequisites met.
+
+**Deployment Window Behavior:**
+- **Migration applied, old code running:** Duplicate emails rejected at database level, may cause generic errors. Not ideal but not catastrophic.
+- **New code deployed:** Proper error handling for duplicate email attempts.
+
+**Index Creation Performance:**
+- PostgreSQL will scan entire Members table to verify uniqueness
+- `CREATE UNIQUE INDEX` can be slow on large tables (100K+ rows)
+- Consider using `CREATE UNIQUE INDEX CONCURRENTLY` for production (manual modification of SQL script)
+- Locks table briefly during index creation
+
+**Rollback Strategy:**
+- Drop index: `DROP INDEX "IX_Members_Email";`
+- Revert application code if duplicate email handling was deployed
+
+### Decisions and Tradeoffs
+
+**Unique Index vs. Unique Constraint:**
+Implemented as a unique index rather than a `UNIQUE` constraint. Both provide the same guarantee, but indexes offer better query performance for lookups by email (login queries). The index serves dual purposes: enforcing uniqueness and optimizing authentication queries. Functionally equivalent to a unique constraint but with performance benefits.
+
+**Multi-Step Migration Approach:**
+Split email uniqueness enforcement into separate migration (V4) from phone number addition (V3). This allows independent deployment timelines if needed. If unique constraint creation fails due to duplicates, it doesn't impact the phone number addition. Smaller migrations are easier to test and rollback. The tradeoff is more migrations to track, but improved safety and flexibility justify this.
+
+**No Automatic Conflict Resolution:**
+Deliberately avoided automatic duplicate resolution in the migration itself. PostgreSQL could automatically delete duplicates or update emails, but this risks data loss or corruption. Requiring manual V3.5 script execution ensures human review of duplicate resolution. Migrations should be deterministic and reversible; automatic deletion is neither. Safety over convenience.
+
+**Concurrent Index Consideration:**
+Default migration uses blocking `CREATE UNIQUE INDEX`. For production deployment on large tables, the SQL script can be manually modified to `CREATE UNIQUE INDEX CONCURRENTLY`, which takes longer but doesn't lock the table. Trade-off: migration time vs. availability. For most library systems (under 100K members), blocking index creation is acceptably fast (<5 seconds). Documented as an option for larger deployments.
+
+---
+
+## V5 - MakePhoneNumberRequired
+
+**Date:** March 5, 2026  
+**Migration File:** `V5__MakePhoneNumberRequired.sql`  
+**EF Migration:** `20260305162919_MakePhoneNumberRequired`
+
+### Description
+Makes the PhoneNumber field mandatory in the Members table. This completes the transition started in V3, after stakeholders have had an opportunity to populate real phone numbers.
+
+### Type of Change
+**Requires Coordination** - Modifies existing data and schema constraints.
+
+### Schema Changes
+
+**Column Modified:**
+- `PhoneNumber` changed from nullable to NOT NULL
+- Default value of `'000-000-0000'` applied to existing NULL values via backfill
+
+**Data Migration:**
+- All existing members with NULL phone numbers are updated to `'000-000-0000'`
+- This is a placeholder value indicating phone number needs to be collected
+
+### API Impact
+
+**Endpoint Behavior Changes:**
+- `GET /api/members` - `phoneNumber` field now always present (never null)
+- `POST /api/members` - Creating members without phone number will fail
+- `PUT /api/members` - Updating members to remove phone number will fail
+
+**Response Contract Changes:**
+
+*Previous Member Response (V3-V4):*
+```json
+{
+  "memberId": 1,
+  "firstName": "Anna", 
+  "lastName": "Berg",
+  "email": "anna@example.com",
+  "phoneNumber": null
+}
+```
+
+*New Member Response (V5):*
+```json
+{
+  "memberId": 1,
+  "firstName": "Anna",
+  "lastName": "Berg",
+  "email": "anna@example.com",
+  "phoneNumber": "000-000-0000"
+}
+```
+
+**Breaking Changes:**
+- **POST/PUT requests must now include `phoneNumber`** - clients that don't send this field will receive validation errors
+- Significant breaking change for write operations
+- Consider adding API deprecation warnings in V3/V4 to prepare clients
+
+### Deployment Notes
+
+**Order of Operations:**
+1. Ensure stakeholders have populated phone numbers for critical members
+2. Apply V5 migration (backfills defaults, makes field required)
+3. Deploy application code with mandatory phone number validation
+4. Update frontend forms to require phone number input
+5. Communicate breaking change to API consumers
+
+**Zero-Downtime:** Partial - migration can be applied with old code, but full functionality requires coordinated deployment.
+
+**Deployment Window Behavior:**
+- **Migration applied, old code running:** Database enforces NOT NULL, but old application doesn't send phone numbers. New member creation fails. **High risk window.**
+- **New code with validation, old database (nullable):** Application sends phone numbers, database accepts. **Safe window.**
+
+**Recommended Deployment Order:**
+1. Deploy application code that handles phone as required (but DB still accepts NULL)
+2. Allow stabilization period (monitor for issues)
+3. Apply V5 migration to enforce NOT NULL at database level
+4. Migration becomes insurance against application bugs
+
+**Rollback Strategy:**
+- If immediate rollback needed, revert to nullable: `ALTER TABLE "Members" ALTER COLUMN "PhoneNumber" DROP NOT NULL;`
+- Application rollback straightforward (remove required validation)
+- Data remains intact (default values persist but become nullable again)
+
+### Decisions and Tradeoffs
+
+**Three-Step Migration Strategy (V3 → V3.5 → V4 → V5):**
+The phone number implementation was deliberately split across multiple migrations rather than a single "add phone required" migration. This staged approach provides several benefits: (1) V3 allows column creation without breaking existing data; (2) Time between V3 and V5 gives stakeholders opportunity to populate legitimate phone numbers; (3) If V5 is delayed, system still functions with optional phone numbers; (4) Each migration is independently testable and rollback-able. Alternative single-migration approach would require either blocking deployment until all phone numbers collected (operationally impractical) or losing phone number collection opportunity. Staging reduces risk at cost of more migrations to manage.
+
+**Default Value Choice:**
+Used `'000-000-0000'` as default phone number rather than empty string or other sentinel. This format: (1) Clearly invalid for actual dialing (won't be misused); (2) Visually distinctive (easy to identify incomplete data); (3) Meets NOT NULL constraint; (4) Valid phone number format (passes basic regex validation). Alternative empty string considered but rejected - empty phone numbers are semantically confusing (does member have no phone or unknown phone?). Alternative "UNKNOWN" rejected - not a valid phone format. The placeholder approach makes data quality issues visible while maintaining technical validity.
+
+**Backfill Before Constraint:**
+Migration explicitly backfills NULL values with default BEFORE altering column to NOT NULL. This ensures migration won't fail due to existing NULL values. Alternative approach of adding NOT NULL with DEFAULT clause works in some databases but PostgreSQL requires explicit backfill for existing rows. Manual backfill provides more control and visibility into how many records are affected. SQL statement logged in migration output for audit purposes.
+
+**Deployment Window Risk:**
+Mitigated "migration before code" deployment risk by recommending inverse deployment order (code first, then migration). This is counter to usual "database changes first" pattern. Justification: Adding validation is safer than enforcing constraint. Application can gracefully handle phone collection, but database constraint causes hard failures. For write-heavy operations like member registration, application-level flexibility is more important than database-level enforcement during transition. Once code is stable, database constraint provides long-term insurance.
+
+**No Phone Number Validation at DB Level:**
+Deliberately avoided CHECK constraints for phone number format (e.g., regex pattern). Phone number formats are highly variable internationally: country codes, extensions, special characters, lengths. Database-level validation would be either too strict (rejecting valid international formats) or too loose (not actually validating). Validation logic belongs in application layer where it can be sophisticated, configurable, and easily updated. Database enforces presence (NOT NULL) and length (20 characters), application enforces format.
+
+---
+
 ## Migration History Summary
 
 | Version | Date | Type | Description |
 |---------|------|------|-------------|
 | V1 | 2026-03-05 | Additive (Non-Breaking) | Initial schema: Books, Members, Loans |
 | V2 | 2026-03-05 | Additive (Potentially Breaking) | Added Authors and BookAuthors tables with many-to-many relationship |
+| V3 | 2026-03-05 | Additive (Non-Breaking) | Added optional PhoneNumber column to Members |
+| V3.5 | 2026-03-05 | Destructive (Manual) | Data cleanup script for duplicate email addresses |
+| V4 | 2026-03-05 | Requires Coordination | Added unique index on Members.Email |
+| V5 | 2026-03-05 | Requires Coordination | Made PhoneNumber required with default backfill |
 
 ---
 
