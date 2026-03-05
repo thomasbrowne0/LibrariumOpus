@@ -6,6 +6,7 @@ public class Book
     public string Title { get; set; } = string.Empty;
     public string ISBN { get; set; } = string.Empty;
     public int PublicationYear { get; set; }
+    public DateTime? RetiredAt { get; set; }
 
     // Navigation properties
     public ICollection<Loan> Loans { get; set; } = new List<Loan>();
