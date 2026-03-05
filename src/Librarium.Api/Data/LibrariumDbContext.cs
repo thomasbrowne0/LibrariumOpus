@@ -27,6 +27,9 @@ public class LibrariumDbContext : DbContext
             entity.Property(e => e.Title).IsRequired().HasMaxLength(500);
             entity.Property(e => e.ISBN).IsRequired().HasMaxLength(20);
             entity.Property(e => e.PublicationYear).IsRequired();
+            
+            // Global query filter for soft delete
+            entity.HasQueryFilter(b => b.RetiredAt == null);
         });
 
         // Configure Member entity

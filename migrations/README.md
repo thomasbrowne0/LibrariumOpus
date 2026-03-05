@@ -801,6 +801,124 @@ Migration makes Status required but does not implement status transition logic (
 
 ---
 
+## V8 - AddSoftDeleteToBooks
+
+**Date:** March 5, 2026  
+**Migration File:** `V8__AddSoftDeleteToBooks.sql`  
+**EF Migration:** `20260305164833_AddSoftDeleteToBooks`
+
+### Description
+Implements soft delete pattern for Books using a RetiredAt timestamp. Books are never physically deleted from the database; instead, they are marked as retired. A global query filter automatically excludes retired books from normal queries.
+
+### Type of Change
+**Additive (Non-Breaking)** - Adds an optional column and introduces soft delete behavior without affecting existing functionality.
+
+### Schema Changes
+
+**Column Added:**
+- `RetiredAt` (timestamp with time zone, nullable) to Books table
+
+**Query Filter Added:**
+- Global query filter on Book entity: `WHERE RetiredAt IS NULL`
+- All queries against Books table automatically filter out retired books
+- Can be bypassed using `IgnoreQueryFilters()` when needed
+
+### API Impact
+
+**New Endpoints:**
+- `DELETE /api/books/{id}` - Soft deletes a book by setting RetiredAt timestamp
+- `GET /api/books/all` - Returns all books including retired ones (uses `IgnoreQueryFilters()`)
+
+**Existing Endpoint Behavior:**
+- `GET /api/books` - Now automatically excludes retired books due to global query filter
+
+**Response Contract Changes:**
+
+*Book Response (Updated):*
+```json
+{
+  "bookId": 1,
+  "title": "The Great Gatsby",
+  "isbn": "978-0-7432-7356-5",
+  "publicationYear": 1925,
+  "retiredAt": null,
+  "authors": [...]
+}
+```
+
+*Book Response (Retired):*
+```json
+{
+  "bookId": 1,
+  "title": "Obsolete Edition",
+  "isbn": "978-1-234-5678-9",
+  "publicationYear": 2000,
+  "retiredAt": "2026-03-05T16:48:33Z",
+  "authors": [...]
+}
+```
+
+**Breaking Changes:** None - RetiredAt is null for all existing books, and normal queries continue to work.
+
+### Deployment Notes
+
+**Order of Operations:**
+1. Apply database migration (adds nullable RetiredAt column)
+2. Deploy application code with soft delete endpoints
+3. Train administrators on using DELETE endpoint vs. hard delete
+4. No data migration required
+
+**Zero-Downtime:** Yes
+
+**Deployment Window Behavior:**
+- **Migration applied, old code running:** RetiredAt column exists but unused. No impact.
+- **New code deployed:** Soft delete functionality available, global query filter active.
+
+**Rollback Strategy:**
+- Revert application code (removes soft delete endpoints and global query filter)
+- Drop column: `ALTER TABLE "Books" DROP COLUMN "RetiredAt";`
+- Any books retired during deployment will become visible again if RetiredAt column is dropped
+
+### Decisions and Tradeoffs
+
+**Soft Delete vs. Hard Delete:**
+Chose soft delete over physical deletion for several reasons: (1) **Data preservation** - retired books may have historical loan records that should be preserved; (2) **Audit trail** - RetiredAt timestamp records when and implicitly why a book was removed from circulation; (3) **Reversibility** - books can be "unretired" by setting RetiredAt back to null if needed; (4) **Referential integrity** - avoids foreign key constraint violations with Loans and BookAuthors tables. Tradeoff: database grows larger over time as retired books accumulate. Mitigation: periodic archival process can move very old retired books to separate archive database.
+
+**Global Query Filter:**
+Implemented using EF Core's `HasQueryFilter()` which automatically adds `WHERE RetiredAt IS NULL` to all queries. Benefits: (1) **Automatic filtering** - developers don't need to remember to filter retired books; (2) **Consistent behavior** - all queries respect soft delete by default; (3) **Explicit bypass** - `IgnoreQueryFilters()` available when retired books needed (e.g., admin views). Tradeoff: can be surprising if developers aren't aware of the filter - queries might return fewer results than expected. EF Core warns about query filters on required relationships (Loans, BookAuthors), which is expected behavior - when a book is retired, its related entities won't be included in normal queries.
+
+**RetiredAt Timestamp vs. Boolean Flag:**
+Used timestamp (`RetiredAt`) rather than boolean (`IsRetired`). Timestamp provides: (1) **More information** - captures when book was retired, not just that it was retired; (2) **Audit capability** - can analyze retirement patterns, find books retired recently for potential mistakes; (3) **Business analytics** - report on retirement trends over time. Nullable timestamp serves dual purpose: null = active, non-null = retired with timestamp. Boolean would require separate CreatedAt/RetiredAt columns for equivalent information.
+
+**Automatic Filter in Relationships:**
+EF Core warns that the Book query filter may cause issues in relationships with Loans and BookAuthors. This is intentional behavior: (1) When querying Loans, if the related Book is retired, the loan still appears but book details may be filtered; (2) Solution: use `IgnoreQueryFilters()` on relationship queries when retired books needed; (3) For most loan queries, filtering retired books is correct - active loans should only reference active books. The warnings can be suppressed or we can configure matching filters on related entities, but the current approach provides flexibility.
+
+**DELETE Endpoint Naming:**
+Named the endpoint `RetireBook` internally but exposed as `DELETE /api/books/{id}` following REST conventions. HTTP DELETE is semantically correct for removing a resource from the collection, even if it's soft delete. Clients don't need to know implementation details (soft vs. hard delete). The endpoint returns `204 No Content` on success, standard for DELETE. If a book is already retired, returns `400 Bad Request` to prevent double-retirement. Uses `IgnoreQueryFilters()` to find even retired books, allowing idempotent behavior checking.
+
+**Admin "All Books" Endpoint:**
+Added `GET /api/books/all` endpoint that bypasses the query filter using `IgnoreQueryFilters()`. This allows administrators to: (1) View retired books for audit purposes; (2) Identify books to potentially unretire; (3) Generate reports including all books regardless of status. Alternative approach: separate admin controller with authentication. Current approach simpler for demonstration, but production should add authorization to prevent unauthorized access to retired book data.
+
+**No Unretire Endpoint:**
+Did not implement an "unretire" endpoint in this phase. Unretiring a book would simply set `RetiredAt = null`. Deliberately left this out because: (1) Unretiring is likely rare and may require business approval; (2) Could be done via direct database update for now; (3) Future enhancement: proper audit logging and authorization for unretiring. When implemented, would be `POST /api/books/{id}/unretire` or `PATCH /api/books/{id}` with RetiredAt field.
+
+**Impact on Existing Loans:**
+Retiring a book does not prevent viewing historical loans for that book. The Loan entity does not have a query filter, so `GET /api/loans/{memberId}` will include loans for retired books. However, the Book navigation property may be null due to the query filter. Future enhancement: configure eager loading with `IgnoreQueryFilters()` for Loan.Book to ensure retired book details are included in loan queries.
+
+**Performance Considerations:**
+The global query filter adds a `WHERE RetiredAt IS NULL` condition to every Book query. Performance impact: (1) Minimal - simple nullable column check with high selectivity (most books not retired); (2) Can be indexed if retired books are numerous: `CREATE INDEX ix_books_retiredat ON Books(RetiredAt) WHERE RetiredAt IS NOT NULL;` (partial index on retired books only); (3) Most queries benefit from smaller result set (fewer books to process). As dataset grows, monitor query performance and add index if needed.
+
+**Future Enhancements:**
+- Add `PATCH /api/books/{id}/unretire` endpoint with authorization
+- Implement retention policy: archive books retired >5 years ago
+- Add audit logging for retire/unretire actions (who, when, why)
+- Extend soft delete to other entities (Authors, Members)
+- Add filtering options: `?includeRetired=true` query parameter
+- Track retirement reason in separate column (lost, damaged, outdated, etc.)
+- Analytics dashboard showing retirement trends and patterns
+
+---
+
 ## Migration History Summary
 
 | Version | Date | Type | Description |
@@ -813,6 +931,7 @@ Migration makes Status required but does not implement status transition logic (
 | V5 | 2026-03-05 | Requires Coordination | Made PhoneNumber required with default backfill |
 | V6 | 2026-03-05 | Additive (Non-Breaking) | Added optional Status column to Loans with API v2 versioning |
 | V7 | 2026-03-05 | Requires Coordination | Made Status required with intelligent backfill from ReturnDate |
+| V8 | 2026-03-05 | Additive (Non-Breaking) | Added soft delete to Books with RetiredAt and global query filter |
 
 ---
 
