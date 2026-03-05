@@ -23,12 +23,24 @@ public class BooksController : ControllerBase
     public async Task<ActionResult<IEnumerable<BookDto>>> GetBooks()
     {
         var books = await _context.Books
+            .Include(b => b.BookAuthors)
+                .ThenInclude(ba => ba.Author)
             .Select(b => new BookDto
             {
                 BookId = b.Id,
                 Title = b.Title,
                 ISBN = b.ISBN,
-                PublicationYear = b.PublicationYear
+                PublicationYear = b.PublicationYear,
+                Authors = b.BookAuthors
+                    .OrderBy(ba => ba.OrderIndex)
+                    .Select(ba => new AuthorDto
+                    {
+                        AuthorId = ba.Author.Id,
+                        FirstName = ba.Author.FirstName,
+                        LastName = ba.Author.LastName,
+                        Biography = ba.Author.Biography
+                    })
+                    .ToList()
             })
             .ToListAsync();
 

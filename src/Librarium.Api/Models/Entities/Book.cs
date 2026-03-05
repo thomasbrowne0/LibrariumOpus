@@ -7,6 +7,7 @@ public class Book
     public string ISBN { get; set; } = string.Empty;
     public int PublicationYear { get; set; }
 
-    // Navigation property
+    // Navigation properties
     public ICollection<Loan> Loans { get; set; } = new List<Loan>();
+    public ICollection<BookAuthor> BookAuthors { get; set; } = new List<BookAuthor>();
 }
